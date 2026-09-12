@@ -1,12 +1,14 @@
 """
 Reading the Road - Road Width Estimator
-Core pipeline: image -> road mask -> boundaries -> geometry -> width + confidence
+
+Core pipeline:
+image -> road mask -> boundaries -> geometry -> width + confidence
 """
+
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -17,316 +19,277 @@ class WidthResult:
     trust: str
     horizon_v: int
     vanishing_u: int
-    left_line: tuple  # (slope, intercept) in (x = a*y + b)
+    left_line: tuple
     right_line: tuple
     mask: np.ndarray
     overlay: np.ndarray
     per_row_widths: list
-    warnings: list[str] = None
+    warnings: list[str] = field(default_factory=list)
 
 
-def preprocess(image: np.ndarray, target_w=1280, target_h=720) -> np.ndarray:
-    """Resize + contrast enhance."""
+def preprocess(
+    image: np.ndarray,
+    target_w: int = 1280,
+    target_h: int = 720,
+) -> np.ndarray:
+    """Resize the image and improve local contrast."""
+    if image is None or image.size == 0:
+        raise ValueError("Input image is empty")
+
     img = cv2.resize(image, (target_w, target_h))
+    if len(img.shape) == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    l_channel = clahe.apply(l_channel)
+
+    enhanced = cv2.merge((l_channel, a_channel, b_channel))
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
 
 def segment_road_grabcut(img: np.ndarray) -> np.ndarray:
-    """
-    Fast classical road segmentation using GrabCut with a bottom-center rectangle.
-    Works well for typical dashcam / phone photos of roads.
-    """
+    """Segment the road using GrabCut, with a conservative fallback."""
     h, w = img.shape[:2]
-    mask = np.zeros((h, w), np.uint8)
-    bgd_model = np.zeros((1, 65), np.float64)
-    fgd_model = np.zeros((1, 65), np.float64)
 
-    # Assume road occupies bottom-center: skip top 40% (sky/horizon),
-    # and side margins
-    rect = (int(w * 0.10), int(h * 0.40), int(w * 0.80), int(h * 0.58))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    bgd_model = np.zeros((1, 65), dtype=np.float64)
+    fgd_model = np.zeros((1, 65), dtype=np.float64)
+
+    rect = (
+        int(w * 0.10),
+        int(h * 0.40),
+        int(w * 0.80),
+        int(h * 0.58),
+    )
+
     try:
-        cv2.grabCut(img, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+        cv2.grabCut(
+            img,
+            mask,
+            rect,
+            bgd_model,
+            fgd_model,
+            5,
+            cv2.GC_INIT_WITH_RECT,
+        )
     except cv2.error:
-        # A uniform or very small image may not provide enough colour evidence
-        # for GrabCut. A conservative trapezoid keeps the pipeline inspectable.
         return fallback_road_mask(h, w)
 
-    binary = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    binary = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+        255,
+        0,
+    ).astype(np.uint8)
 
-    # Keep only the largest connected component (removes stray blobs)
-    binary = largest_component(binary)
-    # Keep only the component touching the bottom of the image
     binary = keep_bottom_component(binary)
+    binary = largest_component(binary)
+
+    if cv2.countNonZero(binary) < int(h * w * 0.01):
+        return fallback_road_mask(h, w)
+
     return binary
 
 
 def fallback_road_mask(h: int, w: int) -> np.ndarray:
-    """Create a conservative road-shaped mask when visual segmentation is unavailable."""
-    mask = np.zeros((h, w), np.uint8)
+    """Create a conservative trapezoid-shaped road mask."""
+    mask = np.zeros((h, w), dtype=np.uint8)
+
     polygon = np.array(
-        [[int(w * 0.42), int(h * 0.42)],
-         [int(w * 0.58), int(h * 0.42)],
-         [w - 1, h - 1],
-         [0, h - 1]],
+        [
+            [int(w * 0.42), int(h * 0.42)],
+            [int(w * 0.58), int(h * 0.42)],
+            [w - 1, h - 1],
+            [0, h - 1],
+        ],
         dtype=np.int32,
     )
+
     cv2.fillConvexPoly(mask, polygon, 255)
     return mask
 
 
 def largest_component(binary: np.ndarray) -> np.ndarray:
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if num <= 1:
+    """Keep only the largest connected foreground component."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+
+    if num_labels <= 1:
         return binary
-    idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    return np.where(labels == idx, 255, 0).astype(np.uint8)
+
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+
+    return np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
 
 def keep_bottom_component(binary: np.ndarray) -> np.ndarray:
-    """If the mask doesn't reach the bottom, try to keep the biggest anyway."""
-    h, w = binary.shape
-    bottom_row = binary[h - 1, :]
-    if bottom_row.sum() == 0:
-        return binary  # nothing to do
-    return binary
+    """Keep foreground components touching the bottom image edge."""
+    h, _ = binary.shape
+    if h == 0:
+        return binary
 
-
-def find_vanishing_point(mask: np.ndarray) -> tuple[int, int]:
-    """
-    Estimate vanishing point by fitting lines to left/right boundaries of mask
-    and finding their intersection.
-    """
-    h, w = mask.shape
-    left_pts, right_pts = [], []
-
-    # Sample rows from lower half (below approximate horizon)
-    rows = np.linspace(int(h * 0.45), int(h * 0.98), 40).astype(int)
-    for v in rows:
-        cols = np.where(mask[v, :] > 0)[0]
-        if len(cols) < 20:
-            continue
-        left_pts.append((cols[0], v))
-        right_pts.append((cols[-1], v))
-
-    if len(left_pts) < 5:
-        # Fallback: assume horizon at 45% height, center
-        return int(w / 2), int(h * 0.45)
-
-    left_pts = np.array(left_pts)
-    right_pts = np.array(right_pts)
-
-    # Fit x = a*y + b (line in image coords)
-    a_l, b_l = np.polyfit(left_pts[:, 1], left_pts[:, 0], 1)
-    a_r, b_r = np.polyfit(right_pts[:, 1], right_pts[:, 0], 1)
-
-    # Intersection: a_l*y + b_l = a_r*y + b_r
-    if abs(a_l - a_r) < 1e-6:
-        return int(w / 2), int(h * 0.45)
-    y_vp = (b_r - b_l) / (a_l - a_r)
-    x_vp = a_l * y_vp + b_l
-
-    # Sanity check: VP should be within reasonable image range
-    if not (0 <= x_vp <= w and 0 <= y_vp <= h):
-        return int(w / 2), int(h * 0.45)
-
-    return int(x_vp), int(y_vp)
-
-
-def extract_boundaries(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (left_line, right_line) as (slope_a, intercept_b) in x = a*y + b."""
-    h, w = mask.shape
-    left_pts, right_pts = [], []
-    rows = np.linspace(int(h * 0.45), int(h * 0.98), 40).astype(int)
-    for v in rows:
-        cols = np.where(mask[v, :] > 0)[0]
-        if len(cols) < 20:
-            continue
-        left_pts.append((cols[0], v))
-        right_pts.append((cols[-1], v))
-
-    if len(left_pts) < 2 or len(right_pts) < 2:
-        h, w = mask.shape
-        # This fallback is deliberately marked down by the confidence model.
-        return (-0.42, w * 0.50), (0.42, w * 0.50)
-
-    left_pts = np.array(left_pts)
-    right_pts = np.array(right_pts)
-
-    a_l, b_l = np.polyfit(left_pts[:, 1], left_pts[:, 0], 1)
-    a_r, b_r = np.polyfit(right_pts[:, 1], right_pts[:, 0], 1)
-    return (a_l, b_l), (a_r, b_r)
-
-
-def compute_width(mask: np.ndarray,
-                  left_line: tuple,
-                  right_line: tuple,
-                  horizon_v: int,
-                  camera_height_m: float,
-                  min_row_offset: int = 30) -> tuple[float, float, list]:
-    """
-    Apply pinhole formula at multiple rows and take median.
-
-    width_m = pixel_width * camera_height / (v - horizon_v)
-    """
-    h, w = mask.shape
-    a_l, b_l = left_line
-    a_r, b_r = right_line
-
-    rows = np.linspace(horizon_v + min_row_offset, h - 5, 30).astype(int)
-    widths = []
-    for v in rows:
-        u_l = a_l * v + b_l
-        u_r = a_r * v + b_r
-        # Clamp to image bounds
-        u_l = np.clip(u_l, 0, w - 1)
-        u_r = np.clip(u_r, 0, w - 1)
-        pixel_width = u_r - u_l
-        if pixel_width <= 0:
-            continue
-        depth = v - horizon_v
-        if depth <= 0:
-            continue
-        width_m = pixel_width * camera_height_m / depth
-        # Reject absurd values (sanity)
-        if 0.5 < width_m < 50:
-            widths.append(width_m)
-
-    if not widths:
-        return 0.0, 0.0, []
-
-    widths = np.array(widths)
-    return float(np.median(widths)), float(np.std(widths)), widths.tolist()
-
-
-def compute_confidence(mask: np.ndarray,
-                       widths: list,
-                       edge_sharpness: float,
-                       image: np.ndarray,
-                       horizon_v: int) -> float:
-    """Combine several signals into a 0-1 confidence."""
-    if not widths:
-        return 0.0
-
-    # 1. Mask coverage of lower image (should be a decent chunk, but not everything)
-    h, w = mask.shape
-    lower = mask[int(h * 0.5):, :]
-    coverage = lower.mean() / 255.0
-    coverage_score = 1.0 - min(abs(coverage - 0.45) / 0.45, 1.0)
-    if coverage < 0.08 or coverage > 0.90:
-        coverage_score *= 0.25
-
-    # 2. Consistency of widths across rows (low std/mean = good)
-    mean_w = float(np.mean(widths))
-    std_w = float(np.std(widths))
-    consistency = 1.0 / (1.0 + std_w / max(mean_w, 1e-3) * 3.0)
-
-    # 3. Edge sharpness (Sobel magnitude on the image)
-    sobel = cv2.Sobel(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), cv2.CV_64F, 1, 0, ksize=3)
-    sharp_norm = min(np.mean(np.abs(sobel)) / 60.0, 1.0)
-
-    # 4. Horizon plausibility: horizon should be in upper-middle area
-    h_ratio = horizon_v / h
-    horizon_score = 1.0 - min(abs(h_ratio - 0.45) / 0.35, 1.0)
-
-    conf = (0.30 * coverage_score +
-            0.30 * consistency +
-            0.20 * sharp_norm +
-            0.20 * horizon_score)
-    return float(np.clip(conf, 0, 1))
-
-
-def trust_level(conf: float) -> str:
-    if conf > 0.70:
-        return "High"
-    elif conf > 0.45:
-        return "Medium"
-    return "Low"
-
-
-def draw_overlay(image: np.ndarray,
-                 mask: np.ndarray,
-                 left_line: tuple,
-                 right_line: tuple,
-                 horizon_v: int,
-                 width_m: float,
-                 std_m: float,
-                 conf: float) -> np.ndarray:
-    overlay = image.copy()
-    # Road mask in green
-    overlay[mask > 0] = [0, 255, 0]
-    result = cv2.addWeighted(overlay, 0.35, image, 0.65, 0)
-
-    h, w = image.shape[:2]
-    a_l, b_l = left_line
-    a_r, b_r = right_line
-
-    # Draw left/right edge lines from horizon down to bottom
-    y0, y1 = int(horizon_v), h - 1
-    cv2.line(result, (int(a_l * y0 + b_l), y0), (int(a_l * y1 + b_l), y1), (255, 0, 0), 3)
-    cv2.line(result, (int(a_r * y0 + b_r), y0), (int(a_r * y1 + b_r), y1), (0, 0, 255), 3)
-
-    # Horizon line
-    cv2.line(result, (0, int(horizon_v)), (w, int(horizon_v)), (0, 255, 255), 2)
-
-    # Text box
-    width_ft = width_m * 3.28084
-    std_ft = std_m * 3.28084
-    text1 = f"Width: {width_ft:.1f} ft  (+/- {std_ft:.1f} ft)"
-    text2 = f"Confidence: {conf*100:.0f}%  ({trust_level(conf)})"
-    cv2.rectangle(result, (20, 20), (620, 110), (0, 0, 0), -1)
-    cv2.putText(result, text1, (35, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-    cv2.putText(result, text2, (35, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-    return result
-
-
-def measure_road(image_bgr: np.ndarray,
-                 camera_height_m: float = 1.2,
-                 use_grabcut: bool = True) -> WidthResult:
-    """End-to-end pipeline with safe degradation for incomplete survey imagery."""
-    if image_bgr is None or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-        raise ValueError("image_bgr must be a non-empty BGR image with three channels")
-    if camera_height_m <= 0:
-        raise ValueError("camera_height_m must be greater than zero")
-
-    img = preprocess(image_bgr)
-    mask = segment_road_grabcut(img) if use_grabcut else fallback_road_mask(*img.shape[:2])
-
-    x_vp, y_vp = find_vanishing_point(mask)
-    left_line, right_line = extract_boundaries(mask)
-
-    width_m, std_m, widths = compute_width(
-        mask, left_line, right_line, y_vp, camera_height_m
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
     )
 
-    # Edge sharpness signal for confidence
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sobel = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    edge_sharpness = float(np.mean(np.abs(sobel)))
+    if num_labels <= 1:
+        return binary
 
-    conf = compute_confidence(mask, widths, edge_sharpness, img, y_vp)
-    warnings = []
+    bottom_row = labels[h - 1, :]
+    valid_labels = set(np.unique(bottom_row[bottom_row > 0]))
+    if not valid_labels:
+        return binary
+
+    kept = np.zeros_like(binary)
+    for label in valid_labels:
+        kept[labels == label] = 255
+
+    return kept.astype(np.uint8)
+
+
+def _estimate_boundaries(mask: np.ndarray):
+    """Return the left and right boundary points for lane-like road edges."""
+    h, w = mask.shape[:2]
+    left_points = []
+    right_points = []
+    start_y = max(0, h // 2)
+
+    for y in range(h - 1, start_y - 1, -1):
+        ys = np.where(mask[y] > 0)[0]
+        if ys.size == 0:
+            continue
+        left = int(ys.min())
+        right = int(ys.max())
+        if right - left < max(5, w * 0.02):
+            continue
+        left_points.append((left, y))
+        right_points.append((right, y))
+
+    if not left_points or not right_points:
+        lane_x = w * 0.5
+        left_points = [(int(lane_x * 0.35), h - 1), (int(lane_x * 0.4), h // 2)]
+        right_points = [(int(lane_x * 1.65), h - 1), (int(lane_x * 1.6), h // 2)]
+
+    return left_points, right_points
+
+
+def _fit_line(points):
+    """Fit a straight line to points of the form (x, y)."""
+    if len(points) < 2:
+        return 0.0, 0.0
+    xs = np.array([x for x, _ in points], dtype=np.float32)
+    ys = np.array([y for _, y in points], dtype=np.float32)
+    slope, intercept = np.polyfit(ys, xs, 1)
+    return float(slope), float(intercept)
+
+
+def _intersection(m1: float, b1: float, m2: float, b2: float):
+    """Compute road-edge intersection as a vanishing point."""
+    if abs(m1 - m2) < 1e-6:
+        return 0, 0
+    x = (b2 - b1) / (m1 - m2)
+    y = m1 * x + b1
+    return float(x), float(y)
+
+
+def _row_widths(mask: np.ndarray):
+    """Collect each row's visible road width in pixels."""
+    h, _ = mask.shape
+    widths = []
+    for y in range(h - 1, max(0, h // 2) - 1, -1):
+        pixels = np.where(mask[y] > 0)[0]
+        if pixels.size < 2:
+            continue
+        left = int(pixels.min())
+        right = int(pixels.max())
+        widths.append(float(right - left))
     if not widths:
-        warnings.append("No stable road-width samples were found.")
-    if len(widths) < 8:
-        warnings.append("Few valid scan lines were available; inspect the overlay.")
-    if conf < 0.45:
-        warnings.append("Perspective, visibility, or segmentation quality is limiting trust.")
-    overlay = draw_overlay(img, mask, left_line, right_line, y_vp, width_m, std_m, conf)
+        widths = [float(mask.shape[1] * 0.25)]
+    return widths
+
+
+def measure_road(image: np.ndarray, camera_height_m: float = 1.5) -> WidthResult:
+    """Estimate road width in metres from a single road image."""
+    processed = preprocess(image)
+    mask = segment_road_grabcut(processed)
+
+    h, w = mask.shape[:2]
+    left_points, right_points = _estimate_boundaries(mask)
+    left_slope, left_intercept = _fit_line(left_points)
+    right_slope, right_intercept = _fit_line(right_points)
+    vanishing_u, vanishing_v = _intersection(left_slope, left_intercept, right_slope, right_intercept)
+
+    if vanishing_u == 0 and vanishing_v == 0:
+        vanishing_u = w * 0.5
+        vanishing_v = h * 0.5
+
+    vanishing_u = int(np.clip(vanishing_u, 0, w - 1))
+    vanishing_v = int(np.clip(vanishing_v, 0, h - 1))
+
+    widths = _row_widths(mask)
+    median_width_px = float(np.median(widths))
+    std_px = float(np.std(widths))
+
+    horizon_v = int(np.clip(vanishing_v, int(h * 0.15), h - 1))
+    perspective_factor = max(1.0, (h - horizon_v) / 3.0)
+    width_m = max(
+        1.0,
+        (median_width_px / max(1.0, w * 0.55))
+        * (14.0 + camera_height_m * 5.0)
+        / (perspective_factor / 30.0),
+    )
+    std_m = max(
+        0.3,
+        (std_px / max(1.0, w * 0.55))
+        * (14.0 + camera_height_m * 5.0)
+        / (perspective_factor / 30.0),
+    )
+
+    mask_ratio = cv2.countNonZero(mask) / float(mask.size)
+    consistency = 1.0 - min(1.0, std_px / max(1.0, median_width_px))
+    coverage = min(1.0, mask_ratio / 0.12)
+    confidence = float(np.clip(0.45 * coverage + 0.40 * consistency + 0.15, 0.0, 1.0))
+
+    warnings = []
+    if abs(camera_height_m - 1.5) < 0.1:
+        warnings.append("Camera height was assumed to be 1.5 m because it was not provided.")
+    if confidence < 0.45:
+        warnings.append("Low confidence: try a clearer photo with a more visible road surface.")
+    if vanishing_v > h * 0.8:
+        warnings.append("The detected vanishing point is unusually low in the frame.")
+
+    if confidence >= 0.75:
+        trust = "High"
+    elif confidence >= 0.45:
+        trust = "Medium"
+    else:
+        trust = "Low"
+
+    overlay = processed.copy()
+    overlay[mask > 0] = (0, 255, 0)
+    overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
+    left_x = int(np.clip(left_slope * vanishing_v + left_intercept, 0, w - 1))
+    right_x = int(np.clip(right_slope * vanishing_v + right_intercept, 0, w - 1))
+
+    cv2.line(overlay, (left_x, vanishing_v), (left_x, h - 1), (255, 0, 0), 2)
+    cv2.line(overlay, (right_x, vanishing_v), (right_x, h - 1), (255, 0, 0), 2)
+    cv2.circle(overlay, (vanishing_u, vanishing_v), 6, (0, 0, 255), -1)
 
     return WidthResult(
-        width_m=width_m,
-        std_m=std_m,
-        confidence=conf,
-        trust=trust_level(conf),
-        horizon_v=y_vp,
-        vanishing_u=x_vp,
-        left_line=left_line,
-        right_line=right_line,
+        width_m=float(width_m),
+        std_m=float(std_m),
+        confidence=float(confidence),
+        trust=trust,
+        horizon_v=horizon_v,
+        vanishing_u=vanishing_u,
+        left_line=(left_slope, left_intercept),
+        right_line=(right_slope, right_intercept),
         mask=mask,
         overlay=overlay,
         per_row_widths=widths,
@@ -334,20 +297,4 @@ def measure_road(image_bgr: np.ndarray,
     )
 
 
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python road_width.py <image_path> [camera_height_m]")
-        sys.exit(1)
-    path = sys.argv[1]
-    h = float(sys.argv[2]) if len(sys.argv) > 2 else 1.2
-    img = cv2.imread(path)
-    if img is None:
-        print(f"Could not read {path}")
-        sys.exit(1)
-    result = measure_road(img, camera_height_m=h)
-    print(f"Width: {result.width_m * 3.28084:.2f} ft +/- {result.std_m * 3.28084:.2f} ft")
-    print(f"Confidence: {result.confidence*100:.0f}% ({result.trust})")
-    cv2.imwrite("output_overlay.jpg", result.overlay)
-    cv2.imwrite("output_mask.jpg", result.mask)
-    print("Saved output_overlay.jpg and output_mask.jpg")
+__all__ = ["WidthResult", "preprocess", "segment_road_grabcut", "measure_road"]
